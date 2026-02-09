@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -29,12 +28,10 @@ def register_sync_tools(mcp: FastMCP, engine: SyncEngine) -> None:
             local_path: Local file path to save. If None, auto-generated.
             force: If True, overwrite local even if conflicts detected.
         """
-        result = asyncio.run(
-            engine.sync_from_lark(
-                document_id=document_id,
-                local_path=local_path,
-                force=force,
-            )
+        result = engine.sync_from_lark(
+            document_id=document_id,
+            local_path=local_path,
+            force=force,
         )
         return result.model_dump()
 
@@ -48,7 +45,7 @@ def register_sync_tools(mcp: FastMCP, engine: SyncEngine) -> None:
         Args:
             local_path: Optional path to check specific file status.
         """
-        entries = asyncio.run(engine.get_sync_status(local_path=local_path))
+        entries = engine.get_sync_status(local_path=local_path)
         return [
             {
                 "local_path": e.local_path,

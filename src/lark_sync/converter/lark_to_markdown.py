@@ -14,6 +14,11 @@ from lark_sync.converter.block_types import BlockType
 from lark_sync.converter.text_elements import elements_to_markdown
 
 
+def _children(block: dict[str, Any]) -> list[Any]:
+    """Safely get children list, handling None values from the API."""
+    return block.get("children") or []
+
+
 class LarkToMarkdownConverter:
     """Stateless converter: Lark block list -> Markdown text."""
 
@@ -122,8 +127,8 @@ class LarkToMarkdownConverter:
         lines: list[str],
         depth: int,
     ) -> None:
-        body = block.get("text", {})
-        md = elements_to_markdown(body.get("elements", []))
+        body = block.get("text") or {}
+        md = elements_to_markdown(body.get("elements") or [])
         lines.append(md)
         lines.append("")
 
@@ -140,8 +145,8 @@ class LarkToMarkdownConverter:
         level = BlockType.heading_level(bt) or 1
         # Lark stores heading body under a key like ``heading1``, ``heading2``, ...
         body_key = f"heading{level}"
-        body = block.get(body_key, {})
-        md = elements_to_markdown(body.get("elements", []))
+        body = block.get(body_key) or {}
+        md = elements_to_markdown(body.get("elements") or [])
         prefix = "#" * min(level, 6)  # Markdown only supports h1-h6
         lines.append(f"{prefix} {md}")
         lines.append("")
@@ -155,11 +160,11 @@ class LarkToMarkdownConverter:
         lines: list[str],
         depth: int,
     ) -> None:
-        body = block.get("bullet", {})
-        md = elements_to_markdown(body.get("elements", []))
+        body = block.get("bullet") or {}
+        md = elements_to_markdown(body.get("elements") or [])
         indent = "  " * depth
         lines.append(f"{indent}- {md}")
-        for child_id in block.get("children", []):
+        for child_id in _children(block):
             self._render_block(tree, child_id, lines, depth + 1)
 
     # -- ORDERED LIST ------------------------------------------------------
@@ -171,11 +176,11 @@ class LarkToMarkdownConverter:
         lines: list[str],
         depth: int,
     ) -> None:
-        body = block.get("ordered", {})
-        md = elements_to_markdown(body.get("elements", []))
+        body = block.get("ordered") or {}
+        md = elements_to_markdown(body.get("elements") or [])
         indent = "  " * depth
         lines.append(f"{indent}1. {md}")
-        for child_id in block.get("children", []):
+        for child_id in _children(block):
             self._render_block(tree, child_id, lines, depth + 1)
 
     # -- CODE BLOCK --------------------------------------------------------
@@ -187,12 +192,13 @@ class LarkToMarkdownConverter:
         lines: list[str],
         depth: int,
     ) -> None:
-        body = block.get("code", {})
-        language = body.get("style", {}).get("language", "")
+        body = block.get("code") or {}
+        style = body.get("style") or {}
+        language = style.get("language", "")
         # Map Lark language enum ints to string labels if needed.
         if isinstance(language, int):
             language = _LANG_MAP.get(language, "")
-        elements = body.get("elements", [])
+        elements = body.get("elements") or []
         code_text = elements_to_markdown(elements)
         lines.append(f"```{language}")
         lines.append(code_text)
@@ -209,7 +215,7 @@ class LarkToMarkdownConverter:
         depth: int,
     ) -> None:
         child_lines: list[str] = []
-        for child_id in block.get("children", []):
+        for child_id in _children(block):
             self._render_block(tree, child_id, child_lines, depth=0)
         for line in child_lines:
             lines.append(f"> {line}" if line else ">")
@@ -224,8 +230,8 @@ class LarkToMarkdownConverter:
         lines: list[str],
         depth: int,
     ) -> None:
-        body = block.get("quote", {})
-        md = elements_to_markdown(body.get("elements", []))
+        body = block.get("quote") or {}
+        md = elements_to_markdown(body.get("elements") or [])
         lines.append(f"> {md}")
         lines.append("")
 
@@ -250,13 +256,13 @@ class LarkToMarkdownConverter:
         lines: list[str],
         depth: int,
     ) -> None:
-        body = block.get("todo", {})
-        md = elements_to_markdown(body.get("elements", []))
-        done = body.get("style", {}).get("done", False)
+        body = block.get("todo") or {}
+        md = elements_to_markdown(body.get("elements") or [])
+        done = (body.get("style") or {}).get("done", False)
         checkbox = "[x]" if done else "[ ]"
         indent = "  " * depth
         lines.append(f"{indent}- {checkbox} {md}")
-        for child_id in block.get("children", []):
+        for child_id in _children(block):
             self._render_block(tree, child_id, lines, depth + 1)
 
     # -- TABLE + TABLE_CELL ------------------------------------------------
@@ -274,14 +280,14 @@ class LarkToMarkdownConverter:
         TABLE_CELL blocks laid out in row-major order.  The table body carries
         ``property.row_size`` and ``property.column_size``.
         """
-        table_body = block.get("table", {})
-        prop = table_body.get("property", {})
+        table_body = block.get("table") or {}
+        prop = table_body.get("property") or {}
         row_count: int = prop.get("row_size", 0)
         col_count: int = prop.get("column_size", 0)
         if row_count == 0 or col_count == 0:
             return
 
-        child_refs: list[str | dict[str, Any]] = block.get("children", [])
+        child_refs: list[str | dict[str, Any]] = _children(block)
 
         # Build a row x col matrix of rendered cell text.
         rows: list[list[str]] = []
@@ -314,13 +320,13 @@ class LarkToMarkdownConverter:
         """Render the content of a single table cell to inline Markdown."""
         # TABLE_CELL blocks contain child blocks (typically TEXT).
         child_parts: list[str] = []
-        for child_ref in cell_block.get("children", []):
+        for child_ref in _children(cell_block):
             child = self._resolve_block(tree, child_ref)
             if child is None:
                 continue
             bt = BlockType.from_value(child.get("block_type", 0))
             if bt == BlockType.TEXT:
-                body = child.get("text", {})
+                body = child.get("text") or {}
                 child_parts.append(elements_to_markdown(body.get("elements", [])))
             else:
                 # Fallback: try generic text extraction.
@@ -342,7 +348,7 @@ class LarkToMarkdownConverter:
         lines: list[str],
         depth: int,
     ) -> None:
-        body = block.get("image", {})
+        body = block.get("image") or {}
         token = body.get("token", "")
         alt = body.get("alt", "image")
         lines.append(f"![{alt}]({token})")
@@ -357,13 +363,13 @@ class LarkToMarkdownConverter:
         lines: list[str],
         depth: int,
     ) -> None:
-        body = block.get("callout", {})
+        body = block.get("callout") or {}
         # Lark callout has an emoji_id that hints at the callout kind.
         emoji_id = body.get("emoji_id", "")
         callout_label = _CALLOUT_LABEL_MAP.get(emoji_id, "NOTE")
 
         child_lines: list[str] = []
-        for child_id in block.get("children", []):
+        for child_id in _children(block):
             self._render_block(tree, child_id, child_lines, depth=0)
 
         lines.append(f"> [!{callout_label}]")
@@ -392,7 +398,7 @@ class LarkToMarkdownConverter:
     _HANDLERS: dict[BlockType, Any] = {
         BlockType.PAGE: lambda self, tree, block, lines, depth: [
             self._render_block(tree, cid, lines, depth)
-            for cid in block.get("children", [])
+            for cid in _children(block)
         ],
         BlockType.TEXT: _render_text,
         BlockType.HEADING1: _render_heading,

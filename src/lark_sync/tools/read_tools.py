@@ -95,15 +95,27 @@ def register_read_tools(mcp: FastMCP, client: LarkClient) -> None:
 
 
 def _block_to_dict(block: Any) -> dict[str, Any]:
-    """Convert a lark_oapi Block object to a plain dict."""
+    """Recursively convert a lark_oapi Block object to a plain dict."""
     if isinstance(block, dict):
-        return block
-    # lark_oapi Block objects have a __dict__ or can be serialized
+        return {k: _convert_value(v) for k, v in block.items()}
     if hasattr(block, "__dict__"):
         d: dict[str, Any] = {}
         for key, value in block.__dict__.items():
             if key.startswith("_"):
                 continue
-            d[key] = value
+            d[key] = _convert_value(value)
         return d
     return {"raw": str(block)}
+
+
+def _convert_value(value: Any) -> Any:
+    """Recursively convert SDK objects, lists, and dicts to plain types."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [_convert_value(item) for item in value]
+    if isinstance(value, dict):
+        return {k: _convert_value(v) for k, v in value.items()}
+    if hasattr(value, "__dict__"):
+        return _block_to_dict(value)
+    return value

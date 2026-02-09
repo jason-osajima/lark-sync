@@ -3,16 +3,6 @@
 Coordinates the entire sync workflow: reading local files, fetching
 remote blocks, converting between formats, detecting conflicts, and
 updating the sync state.
-
-The engine depends on three collaborators injected at construction time:
-
-- **lark_client** -- a ``LarkClient`` instance for API calls.
-- **lark_to_md_converter** -- converts Lark blocks to Markdown text.
-- **md_to_lark_converter** -- converts Markdown text to Lark blocks.
-
-These are referenced via structural typing (duck typing with type
-hints) so that the engine module does not create hard import-time
-dependencies on modules that may not be built yet.
 """
 
 from __future__ import annotations
@@ -21,9 +11,9 @@ import logging
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from lark_sync.sync.conflict import ConflictDetector, ConflictType
 from lark_sync.sync.differ import SyncDiffer
@@ -31,68 +21,11 @@ from lark_sync.sync.state import (
     SyncDirection,
     SyncMapping,
     SyncStateManager,
-    compute_content_hash,
     compute_file_hash,
 )
-
-if TYPE_CHECKING:
-    pass
+from lark_sync.tools.read_tools import _block_to_dict
 
 logger = logging.getLogger(__name__)
-
-
-# ------------------------------------------------------------------
-# Protocols for collaborators (structural typing)
-# ------------------------------------------------------------------
-
-
-class DocumentsAPI(Protocol):
-    """Structural interface for the Lark documents sub-client."""
-
-    async def create_document(
-        self, title: str, folder_token: str | None = None
-    ) -> Any: ...
-
-    async def get_document(self, document_id: str) -> Any: ...
-
-
-class BlocksAPI(Protocol):
-    """Structural interface for the Lark blocks sub-client."""
-
-    async def list_blocks(self, document_id: str) -> list[dict[str, Any]]: ...
-
-    async def create_children(
-        self,
-        document_id: str,
-        parent_block_id: str,
-        blocks: list[dict[str, Any]],
-    ) -> list[Any]: ...
-
-    async def batch_delete(
-        self, document_id: str, block_ids: list[str]
-    ) -> bool: ...
-
-
-class LarkClientProtocol(Protocol):
-    """Structural interface for the Lark API client."""
-
-    @property
-    def documents(self) -> DocumentsAPI: ...
-
-    @property
-    def blocks(self) -> BlocksAPI: ...
-
-
-class LarkToMdConverterProtocol(Protocol):
-    """Structural interface for the Lark-blocks-to-Markdown converter."""
-
-    def convert(self, blocks: list[dict[str, Any]]) -> str: ...
-
-
-class MdToLarkConverterProtocol(Protocol):
-    """Structural interface for the Markdown-to-Lark-blocks converter."""
-
-    def convert(self, markdown_text: str) -> list[dict[str, Any]]: ...
 
 
 # ------------------------------------------------------------------
@@ -142,7 +75,7 @@ class SyncEngine:
     Lark cloud documents.
 
     Args:
-        lark_client: Client for interacting with the Lark Open API.
+        lark_client: A ``LarkClient`` instance for API calls.
         state_manager: Manages sync state persistence.
         lark_to_md_converter: Converts Lark block trees to Markdown.
         md_to_lark_converter: Converts Markdown text to Lark blocks.
@@ -150,10 +83,10 @@ class SyncEngine:
 
     def __init__(
         self,
-        lark_client: LarkClientProtocol,
+        lark_client: Any,
         state_manager: SyncStateManager,
-        lark_to_md_converter: LarkToMdConverterProtocol,
-        md_to_lark_converter: MdToLarkConverterProtocol,
+        lark_to_md_converter: Any,
+        md_to_lark_converter: Any,
     ) -> None:
         self._client = lark_client
         self._state = state_manager
@@ -166,7 +99,7 @@ class SyncEngine:
     # Push: local Markdown -> Lark
     # ------------------------------------------------------------------
 
-    async def sync_to_lark(
+    def sync_to_lark(
         self,
         local_path: str,
         document_id: str | None = None,
@@ -179,16 +112,6 @@ class SyncEngine:
         If ``document_id`` is provided the existing document is updated
         (all child blocks are cleared and recreated).  Otherwise a new
         document is created in the specified ``folder_token``.
-
-        Args:
-            local_path: Path to the local Markdown file.
-            document_id: Optional existing Lark document to update.
-            folder_token: Folder token for new document creation.
-            wiki_space_id: Optional wiki space ID for the mapping.
-            force: Skip conflict detection when ``True``.
-
-        Returns:
-            A ``SyncResult`` describing the outcome.
         """
         path = Path(local_path)
         if not path.exists():
@@ -201,17 +124,14 @@ class SyncEngine:
         markdown_content = path.read_text(encoding="utf-8")
         mapping = self._state.get_mapping(local_path)
 
-        # Resolve document_id from existing mapping if not explicitly given.
         if document_id is None and mapping is not None:
             document_id = mapping.lark_document_id
 
-        # ----------------------------------------------------------
         # Conflict detection
-        # ----------------------------------------------------------
         if not force and mapping is not None and document_id is not None:
             try:
-                doc_info = await self._client.documents.get_document(document_id)
-                current_revision: int = getattr(doc_info, "revision", 0)
+                doc_info = self._client.documents.get(document_id)
+                current_revision: int = doc_info.revision_id
                 conflict = self._conflict_detector.detect(mapping, current_revision)
                 if conflict == ConflictType.BOTH_CHANGED:
                     return SyncResult(
@@ -225,48 +145,35 @@ class SyncEngine:
                         conflict=conflict,
                     )
             except Exception as exc:
-                logger.warning(
-                    "Failed to fetch document for conflict check: %s", exc
-                )
+                logger.warning("Failed conflict check: %s", exc)
 
-        # ----------------------------------------------------------
         # Convert Markdown -> Lark blocks
-        # ----------------------------------------------------------
         lark_blocks = self._to_lark.convert(markdown_content)
 
-        # ----------------------------------------------------------
         # Create or update the remote document
-        # ----------------------------------------------------------
         document_url = ""
 
         if document_id is not None:
-            # Update existing document: clear children, then recreate.
-            await self._clear_document_blocks(document_id)
+            self._clear_document_blocks(document_id)
             if lark_blocks:
-                await self._client.blocks.create_children(
+                self._client.blocks.create_children(
                     document_id, document_id, lark_blocks
                 )
-            # Fetch the updated document to get the new revision.
-            doc_info = await self._client.documents.get_document(document_id)
-            new_revision: int = getattr(doc_info, "revision", 0)
+            doc_info = self._client.documents.get(document_id)
+            new_revision: int = doc_info.revision_id
         else:
-            # Create a new document.
             title = path.stem.replace("-", " ").replace("_", " ").title()
-            doc_response = await self._client.documents.create_document(
-                title, folder_token
-            )
+            doc_response = self._client.documents.create(title, folder_token)
             document_id = doc_response.document_id
             if lark_blocks:
-                await self._client.blocks.create_children(
+                self._client.blocks.create_children(
                     document_id, document_id, lark_blocks
                 )
-            doc_info = await self._client.documents.get_document(document_id)
-            new_revision = getattr(doc_info, "revision", 0)
-            document_url = getattr(doc_info, "url", "")
+            doc_info = self._client.documents.get(document_id)
+            new_revision = doc_info.revision_id
+            document_url = ""
 
-        # ----------------------------------------------------------
         # Update sync state
-        # ----------------------------------------------------------
         now = datetime.now(timezone.utc)
         current_hash = compute_file_hash(local_path)
 
@@ -295,9 +202,7 @@ class SyncEngine:
 
         logger.info(
             "Synced local file %s -> Lark document %s (rev %d)",
-            local_path,
-            document_id,
-            new_revision,
+            local_path, document_id, new_revision,
         )
 
         return SyncResult(
@@ -312,36 +217,21 @@ class SyncEngine:
     # Pull: Lark -> local Markdown
     # ------------------------------------------------------------------
 
-    async def sync_from_lark(
+    def sync_from_lark(
         self,
         document_id: str,
         local_path: str | None = None,
         force: bool = False,
     ) -> SyncResult:
-        """Pull a Lark document and write it as a local Markdown file.
-
-        If ``local_path`` is not specified, the path is inferred from
-        an existing mapping or derived from the document title.
-
-        Args:
-            document_id: The Lark document identifier.
-            local_path: Optional explicit output path.
-            force: Skip conflict detection when ``True``.
-
-        Returns:
-            A ``SyncResult`` describing the outcome.
-        """
+        """Pull a Lark document and write it as a local Markdown file."""
         mapping = self._state.get_mapping_by_doc_id(document_id)
 
-        # Resolve local_path from mapping if not given.
         if local_path is None and mapping is not None:
             local_path = mapping.local_path
 
-        # ----------------------------------------------------------
-        # Fetch remote document metadata and blocks
-        # ----------------------------------------------------------
+        # Fetch remote document metadata
         try:
-            doc_info = await self._client.documents.get_document(document_id)
+            doc_info = self._client.documents.get(document_id)
         except Exception as exc:
             return SyncResult(
                 success=False,
@@ -350,11 +240,10 @@ class SyncEngine:
                 local_path=local_path or "",
             )
 
-        current_revision: int = getattr(doc_info, "revision", 0)
-        document_title: str = getattr(doc_info, "title", "untitled")
-        document_url: str = getattr(doc_info, "url", "")
+        current_revision: int = doc_info.revision_id
+        document_title: str = doc_info.title
+        document_url: str = ""
 
-        # Derive local_path from title if still not resolved.
         if local_path is None:
             safe_name = (
                 document_title.lower()
@@ -363,9 +252,7 @@ class SyncEngine:
             )
             local_path = f"{safe_name}.md"
 
-        # ----------------------------------------------------------
         # Conflict detection
-        # ----------------------------------------------------------
         if not force and mapping is not None:
             conflict = self._conflict_detector.detect(mapping, current_revision)
             if conflict == ConflictType.BOTH_CHANGED:
@@ -380,11 +267,10 @@ class SyncEngine:
                     conflict=conflict,
                 )
 
-        # ----------------------------------------------------------
         # Fetch blocks and convert to Markdown
-        # ----------------------------------------------------------
         try:
-            blocks = await self._client.blocks.list_blocks(document_id)
+            raw_blocks = self._client.blocks.list_all_blocks(document_id)
+            blocks = [_block_to_dict(b) for b in raw_blocks]
         except Exception as exc:
             return SyncResult(
                 success=False,
@@ -402,22 +288,17 @@ class SyncEngine:
             old_content = path.read_text(encoding="utf-8")
             diff_summary = self._differ.compute_diff(old_content, markdown_content)
 
-        # ----------------------------------------------------------
         # Write to local file
-        # ----------------------------------------------------------
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(markdown_content, encoding="utf-8")
 
-        # ----------------------------------------------------------
         # Update sync state
-        # ----------------------------------------------------------
         now = datetime.now(timezone.utc)
         current_hash = compute_file_hash(local_path)
 
         if mapping is not None:
             self._state.update_mapping(
                 mapping.local_path,
-                local_path=local_path,
                 lark_document_url=document_url or mapping.lark_document_url,
                 last_synced_at=now,
                 local_hash_at_sync=current_hash,
@@ -437,9 +318,7 @@ class SyncEngine:
 
         logger.info(
             "Synced Lark document %s -> local file %s (rev %d)",
-            document_id,
-            local_path,
-            current_revision,
+            document_id, local_path, current_revision,
         )
 
         return SyncResult(
@@ -455,19 +334,10 @@ class SyncEngine:
     # Status
     # ------------------------------------------------------------------
 
-    async def get_sync_status(
+    def get_sync_status(
         self, local_path: str | None = None
     ) -> list[SyncStatusEntry]:
-        """Return the sync status of all tracked mappings, or a single
-        mapping identified by ``local_path``.
-
-        Args:
-            local_path: If provided, restrict the status report to this
-                single mapping.
-
-        Returns:
-            A list of ``SyncStatusEntry`` objects.
-        """
+        """Return the sync status of all tracked mappings."""
         state = self._state.load()
         mappings = state.mappings
 
@@ -477,7 +347,7 @@ class SyncEngine:
         entries: list[SyncStatusEntry] = []
 
         for mapping in mappings:
-            status = await self._compute_status(mapping)
+            status = self._compute_status(mapping)
             entries.append(
                 SyncStatusEntry(
                     local_path=mapping.local_path,
@@ -494,17 +364,11 @@ class SyncEngine:
     # Private helpers
     # ------------------------------------------------------------------
 
-    async def _compute_status(self, mapping: SyncMapping) -> SyncStatusLabel:
-        """Determine the current sync status label for a mapping.
-
-        This makes a lightweight API call to fetch the current revision.
-        If the call fails the status is reported as ``UNLINKED``.
-        """
+    def _compute_status(self, mapping: SyncMapping) -> SyncStatusLabel:
+        """Determine the current sync status label for a mapping."""
         try:
-            doc_info = await self._client.documents.get_document(
-                mapping.lark_document_id
-            )
-            current_revision: int = getattr(doc_info, "revision", 0)
+            doc_info = self._client.documents.get(mapping.lark_document_id)
+            current_revision: int = doc_info.revision_id
         except Exception:
             return SyncStatusLabel.UNLINKED
 
@@ -519,21 +383,18 @@ class SyncEngine:
 
         return status_map.get(conflict, SyncStatusLabel.UNLINKED)
 
-    async def _clear_document_blocks(self, document_id: str) -> None:
-        """Remove all child blocks from a document's root page block.
+    def _clear_document_blocks(self, document_id: str) -> None:
+        """Remove all child blocks from a document's root page block."""
+        raw_blocks = self._client.blocks.list_all_blocks(document_id)
 
-        The Lark API uses the document_id as the page-level block ID,
-        and all top-level content blocks are its children.
-        """
-        blocks = await self._client.blocks.list_blocks(document_id)
+        child_count = 0
+        for b in raw_blocks:
+            bid = getattr(b, "block_id", None) or (b.get("block_id") if isinstance(b, dict) else None)
+            pid = getattr(b, "parent_id", None) or (b.get("parent_id") if isinstance(b, dict) else None)
+            if bid != document_id and pid == document_id:
+                child_count += 1
 
-        # Collect IDs of all child blocks (skip the page block itself).
-        child_ids = [
-            block["block_id"]
-            for block in blocks
-            if block.get("block_id") != document_id
-            and block.get("parent_id") == document_id
-        ]
-
-        if child_ids:
-            await self._client.blocks.batch_delete(document_id, child_ids)
+        if child_count > 0:
+            self._client.blocks.batch_delete(
+                document_id, document_id, 0, child_count
+            )

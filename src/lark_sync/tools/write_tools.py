@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from lark_sync.converter import LarkToMarkdownConverter, MarkdownToLarkConverter
+from lark_sync.converter import MarkdownToLarkConverter
 from lark_sync.lark_client import LarkClient
 from lark_sync.sync.engine import SyncEngine
-from lark_sync.sync.state import SyncStateManager
 
 
 def register_write_tools(
@@ -93,13 +91,11 @@ def register_write_tools(
             folder_token: Lark Drive folder for new documents.
             force: If True, overwrite remote even if conflicts detected.
         """
-        result = asyncio.run(
-            engine.sync_to_lark(
-                local_path=local_path,
-                document_id=document_id,
-                folder_token=folder_token,
-                force=force,
-            )
+        result = engine.sync_to_lark(
+            local_path=local_path,
+            document_id=document_id,
+            folder_token=folder_token,
+            force=force,
         )
         return result.model_dump()
 
