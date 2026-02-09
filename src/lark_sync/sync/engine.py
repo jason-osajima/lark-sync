@@ -23,6 +23,20 @@ from lark_sync.sync.state import (
     SyncStateManager,
     compute_file_hash,
 )
+from lark_oapi.api.docx.v1 import (
+    BatchUpdateDocumentBlockRequest,
+    BatchUpdateDocumentBlockRequestBody,
+    InsertTableRowRequest,
+    PatchDocumentBlockRequest,
+    TextElement,
+    TextRun,
+    TextElementStyle,
+    UpdateBlockRequest,
+    UpdateTextElementsRequest,
+)
+
+from lark_sync.converter.block_types import BlockType
+from lark_sync.converter.text_elements import parse_inline_markdown
 from lark_sync.tools.read_tools import _block_to_dict
 
 logger = logging.getLogger(__name__)
@@ -156,7 +170,7 @@ class SyncEngine:
         if document_id is not None:
             self._clear_document_blocks(document_id)
             if lark_blocks:
-                self._client.blocks.create_children(
+                self._create_blocks_with_nesting(
                     document_id, document_id, lark_blocks
                 )
             doc_info = self._client.documents.get(document_id)
@@ -166,7 +180,7 @@ class SyncEngine:
             doc_response = self._client.documents.create(title, folder_token)
             document_id = doc_response.document_id
             if lark_blocks:
-                self._client.blocks.create_children(
+                self._create_blocks_with_nesting(
                     document_id, document_id, lark_blocks
                 )
             doc_info = self._client.documents.get(document_id)
@@ -382,6 +396,224 @@ class SyncEngine:
         }
 
         return status_map.get(conflict, SyncStatusLabel.UNLINKED)
+
+    def _create_blocks_with_nesting(
+        self,
+        document_id: str,
+        parent_block_id: str,
+        blocks: list[dict[str, Any]],
+    ) -> None:
+        """Create blocks under a parent, handling nested children.
+
+        The Lark API rejects ``children`` in the create payload.  Container
+        blocks are handled specially:
+
+        - **TABLE**: created empty (API auto-generates cells with TEXT
+          children), then each cell's TEXT block is updated via batch update.
+        - **QUOTE_CONTAINER**: created empty, then child blocks are added
+          via ``create_children`` on the container.
+
+        Flat (non-container) blocks are batched together for efficiency.
+        """
+        flat_batch: list[dict[str, Any]] = []
+
+        for block in blocks:
+            children = block.get("children")
+            if not children:
+                flat_batch.append(block)
+                continue
+
+            # Flush any pending flat batch before handling a container.
+            if flat_batch:
+                self._client.blocks.create_children(
+                    document_id, parent_block_id, flat_batch
+                )
+                flat_batch = []
+
+            bt = BlockType.from_value(block.get("block_type", 0))
+
+            if bt == BlockType.TABLE:
+                self._create_table_block(document_id, parent_block_id, block)
+            else:
+                # Generic container: create without children, then add children.
+                container = {k: v for k, v in block.items() if k != "children"}
+                created = self._client.blocks.create_children(
+                    document_id, parent_block_id, [container]
+                )
+                if created:
+                    created_id = getattr(created[0], "block_id", None)
+                    if created_id:
+                        self._create_blocks_with_nesting(
+                            document_id, created_id, children
+                        )
+
+        # Flush any remaining flat batch.
+        if flat_batch:
+            self._client.blocks.create_children(
+                document_id, parent_block_id, flat_batch
+            )
+
+    # Maximum rows the Lark API allows in a single table creation call.
+    _MAX_TABLE_ROWS = 9
+
+    def _create_table_block(
+        self,
+        document_id: str,
+        parent_block_id: str,
+        table_block: dict[str, Any],
+    ) -> None:
+        """Create a TABLE block and populate its cells.
+
+        The Lark API auto-creates TABLE_CELL blocks (each with an empty TEXT
+        child) when a TABLE is created.  We then batch-update the TEXT blocks
+        to set the actual cell content.
+
+        Tables exceeding 9 rows are created with 9 rows initially, then
+        additional rows are appended via ``insert_table_row``.
+        """
+        children = table_block.get("children") or []
+        table_body = table_block.get("table") or {}
+        prop = table_body.get("property") or {}
+        total_rows: int = prop.get("row_size", 0)
+        col_count: int = prop.get("column_size", 0)
+
+        if total_rows == 0 or col_count == 0:
+            return
+
+        # 1. Create the TABLE block (capped at 9 rows).
+        initial_rows = min(total_rows, self._MAX_TABLE_ROWS)
+        create_block = {
+            "block_type": table_block["block_type"],
+            "table": {
+                "property": {
+                    "row_size": initial_rows,
+                    "column_size": col_count,
+                },
+            },
+        }
+        created = self._client.blocks.create_children(
+            document_id, parent_block_id, [create_block]
+        )
+        if not created:
+            return
+
+        table_obj = created[0]
+        table_id = getattr(table_obj, "block_id", None)
+        if not table_id:
+            return
+
+        # 2. Insert additional rows if the table exceeds 9 rows.
+        for row_idx in range(initial_rows, total_rows):
+            insert_row = (
+                InsertTableRowRequest.builder().row_index(row_idx).build()
+            )
+            update_body = (
+                UpdateBlockRequest.builder()
+                .block_id(table_id)
+                .insert_table_row(insert_row)
+                .build()
+            )
+            request = (
+                PatchDocumentBlockRequest.builder()
+                .document_id(document_id)
+                .block_id(table_id)
+                .request_body(update_body)
+                .build()
+            )
+            response = self._client.raw.docx.v1.document_block.patch(request)
+            if not response.success():
+                logger.warning(
+                    "Failed to insert table row %d: code=%s, msg=%s",
+                    row_idx,
+                    response.code,
+                    response.msg,
+                )
+
+        # 3. Refresh the table block to get all cell IDs (including new rows).
+        table_obj = self._client.blocks.get_block(document_id, table_id)
+        cell_ids: list[str] = getattr(table_obj, "children", None) or []
+
+        if not cell_ids:
+            return
+
+        # 4. Get the TEXT child block ID for each cell.
+        cell_text_ids: list[str] = []
+        for cid in cell_ids:
+            cell = self._client.blocks.get_block(document_id, cid)
+            cell_children = getattr(cell, "children", None) or []
+            cell_text_ids.append(cell_children[0] if cell_children else "")
+
+        # 5. Build batch update requests to populate cell content.
+        updates: list[Any] = []
+        for i, text_block_id in enumerate(cell_text_ids):
+            if not text_block_id:
+                continue
+
+            cell_text = self._extract_cell_text(children, i)
+            if not cell_text:
+                continue
+
+            style = TextElementStyle.builder().build()
+            text_run = (
+                TextRun.builder()
+                .content(cell_text)
+                .text_element_style(style)
+                .build()
+            )
+            element = TextElement.builder().text_run(text_run).build()
+            update_elements = (
+                UpdateTextElementsRequest.builder().elements([element]).build()
+            )
+            update = (
+                UpdateBlockRequest.builder()
+                .block_id(text_block_id)
+                .update_text_elements(update_elements)
+                .build()
+            )
+            updates.append(update)
+
+        # 6. Execute batch update.
+        if updates:
+            body = (
+                BatchUpdateDocumentBlockRequestBody.builder()
+                .requests(updates)
+                .build()
+            )
+            request = (
+                BatchUpdateDocumentBlockRequest.builder()
+                .document_id(document_id)
+                .request_body(body)
+                .build()
+            )
+            response = self._client.raw.docx.v1.document_block.batch_update(
+                request
+            )
+            if not response.success():
+                logger.warning(
+                    "Failed to batch-update table cells: code=%s, msg=%s",
+                    response.code,
+                    response.msg,
+                )
+
+    @staticmethod
+    def _extract_cell_text(
+        children: list[dict[str, Any]], index: int
+    ) -> str:
+        """Extract plain text content from a converter TABLE_CELL child."""
+        if index >= len(children):
+            return ""
+        cell_dict = children[index]
+        cell_children = cell_dict.get("children") or []
+        if not cell_children:
+            return ""
+        text_dict = cell_children[0]
+        text_body = text_dict.get("text") or {}
+        elements = text_body.get("elements") or []
+        parts = []
+        for el in elements:
+            tr = el.get("text_run") or {}
+            parts.append(tr.get("content", ""))
+        return "".join(parts)
 
     def _clear_document_blocks(self, document_id: str) -> None:
         """Remove all child blocks from a document's root page block."""

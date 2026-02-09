@@ -53,7 +53,7 @@ def register_write_tools(
                 client.blocks.batch_delete(document_id, document_id, 0, len(child_ids))
 
             if blocks:
-                client.blocks.create_children(document_id, document_id, blocks)
+                engine._create_blocks_with_nesting(document_id, document_id, blocks)
 
             doc = client.documents.get(document_id)
             return {
@@ -65,7 +65,7 @@ def register_write_tools(
             doc_title = title or "Untitled Document"
             doc = client.documents.create(doc_title, folder_token)
             if blocks:
-                client.blocks.create_children(doc.document_id, doc.document_id, blocks)
+                engine._create_blocks_with_nesting(doc.document_id, doc.document_id, blocks)
 
             return {
                 "document_id": doc.document_id,
