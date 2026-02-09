@@ -32,6 +32,7 @@ from lark_oapi.api.docx.v1 import (
     TextRun,
     TextElementStyle,
     UpdateBlockRequest,
+    UpdateTablePropertyRequest,
     UpdateTextElementsRequest,
 )
 
@@ -541,6 +542,8 @@ class SyncEngine:
 
     # Maximum rows the Lark API allows in a single table creation call.
     _MAX_TABLE_ROWS = 9
+    # Approximate page content width in pixels for full-width tables.
+    _TABLE_PAGE_WIDTH = 686
 
     def _create_table_block(
         self,
@@ -615,7 +618,31 @@ class SyncEngine:
                     response.msg,
                 )
 
-        # 3. Refresh the table block to get all cell IDs (including new rows).
+        # 3. Set column widths to fill the page (~686px).
+        col_width = self._TABLE_PAGE_WIDTH // col_count
+        for col_idx in range(col_count):
+            update_table = (
+                UpdateTablePropertyRequest.builder()
+                .column_index(col_idx)
+                .column_width(col_width)
+                .build()
+            )
+            update_body = (
+                UpdateBlockRequest.builder()
+                .block_id(table_id)
+                .update_table_property(update_table)
+                .build()
+            )
+            request = (
+                PatchDocumentBlockRequest.builder()
+                .document_id(document_id)
+                .block_id(table_id)
+                .request_body(update_body)
+                .build()
+            )
+            self._client.raw.docx.v1.document_block.patch(request)
+
+        # 4. Refresh the table block to get all cell IDs (including new rows).
         table_obj = self._client.blocks.get_block(document_id, table_id)
         cell_ids: list[str] = getattr(table_obj, "children", None) or []
 
