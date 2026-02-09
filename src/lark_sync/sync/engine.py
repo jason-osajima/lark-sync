@@ -88,12 +88,18 @@ class SyncEngine:
     """Orchestrates bidirectional sync between local Markdown files and
     Lark cloud documents.
 
+    Automatically detects project-local ``.lark-sync.json`` files at the
+    Git repository root for any synced file.  Falls back to the global
+    state file when no project-local state exists.
+
     Args:
         lark_client: A ``LarkClient`` instance for API calls.
-        state_manager: Manages sync state persistence.
+        state_manager: Global state manager (fallback).
         lark_to_md_converter: Converts Lark block trees to Markdown.
         md_to_lark_converter: Converts Markdown text to Lark blocks.
     """
+
+    PROJECT_STATE_FILENAME = ".lark-sync.json"
 
     def __init__(
         self,
@@ -108,6 +114,44 @@ class SyncEngine:
         self._to_lark = md_to_lark_converter
         self._conflict_detector = ConflictDetector()
         self._differ = SyncDiffer()
+        self._project_states: dict[Path, SyncStateManager] = {}
+
+    # ------------------------------------------------------------------
+    # Project-local state detection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_git_root(file_path: str) -> Path | None:
+        """Walk up from *file_path* to find the Git repository root."""
+        current = Path(file_path).resolve()
+        if current.is_file():
+            current = current.parent
+        for parent in [current, *current.parents]:
+            if (parent / ".git").exists():
+                return parent
+        return None
+
+    def _get_state_manager(self, local_path: str) -> SyncStateManager:
+        """Return the appropriate state manager for *local_path*.
+
+        If the file lives inside a Git repo that has a
+        ``.lark-sync.json``, a project-local ``SyncStateManager`` is
+        returned (cached per project root).  Otherwise the global
+        state manager is used.
+        """
+        git_root = self._find_git_root(local_path)
+        if git_root is None:
+            return self._state
+
+        project_state_file = git_root / self.PROJECT_STATE_FILENAME
+        if not project_state_file.exists():
+            return self._state
+
+        if git_root not in self._project_states:
+            self._project_states[git_root] = SyncStateManager(
+                str(project_state_file), project_root=git_root
+            )
+        return self._project_states[git_root]
 
     # ------------------------------------------------------------------
     # Push: local Markdown -> Lark
@@ -136,7 +180,8 @@ class SyncEngine:
             )
 
         markdown_content = path.read_text(encoding="utf-8")
-        mapping = self._state.get_mapping(local_path)
+        state_mgr = self._get_state_manager(local_path)
+        mapping = state_mgr.get_mapping(local_path)
 
         if document_id is None and mapping is not None:
             document_id = mapping.lark_document_id
@@ -192,7 +237,7 @@ class SyncEngine:
         current_hash = compute_file_hash(local_path)
 
         if mapping is not None:
-            self._state.update_mapping(
+            state_mgr.update_mapping(
                 local_path,
                 lark_document_id=document_id,
                 lark_document_url=document_url or mapping.lark_document_url,
@@ -212,7 +257,7 @@ class SyncEngine:
                 remote_revision_at_sync=new_revision,
                 sync_direction=SyncDirection.TO_LARK,
             )
-            self._state.add_mapping(new_mapping)
+            state_mgr.add_mapping(new_mapping)
 
         logger.info(
             "Synced local file %s -> Lark document %s (rev %d)",
@@ -231,6 +276,23 @@ class SyncEngine:
     # Pull: Lark -> local Markdown
     # ------------------------------------------------------------------
 
+    def _find_mapping_by_doc_id(
+        self, document_id: str
+    ) -> tuple[SyncMapping | None, SyncStateManager]:
+        """Search all known state managers for a mapping by document ID.
+
+        Returns the mapping and the state manager that owns it.  The global
+        state is checked first, then any cached project-local states.
+        """
+        mapping = self._state.get_mapping_by_doc_id(document_id)
+        if mapping is not None:
+            return mapping, self._state
+        for mgr in self._project_states.values():
+            mapping = mgr.get_mapping_by_doc_id(document_id)
+            if mapping is not None:
+                return mapping, mgr
+        return None, self._state
+
     def sync_from_lark(
         self,
         document_id: str,
@@ -238,10 +300,13 @@ class SyncEngine:
         force: bool = False,
     ) -> SyncResult:
         """Pull a Lark document and write it as a local Markdown file."""
-        mapping = self._state.get_mapping_by_doc_id(document_id)
+        mapping, state_mgr = self._find_mapping_by_doc_id(document_id)
 
         if local_path is None and mapping is not None:
             local_path = mapping.local_path
+            # If the stored path is relative and we have a project root, resolve it.
+            if state_mgr.project_root and not Path(local_path).is_absolute():
+                local_path = state_mgr.resolve_path(local_path)
 
         # Fetch remote document metadata
         try:
@@ -306,12 +371,13 @@ class SyncEngine:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(markdown_content, encoding="utf-8")
 
-        # Update sync state
+        # Update sync state — use the state manager that owns the mapping,
+        # or resolve one from the local_path for new mappings.
         now = datetime.now(timezone.utc)
         current_hash = compute_file_hash(local_path)
 
         if mapping is not None:
-            self._state.update_mapping(
+            state_mgr.update_mapping(
                 mapping.local_path,
                 lark_document_url=document_url or mapping.lark_document_url,
                 last_synced_at=now,
@@ -319,6 +385,8 @@ class SyncEngine:
                 remote_revision_at_sync=current_revision,
             )
         else:
+            # For new mappings, pick the right state manager from the local path.
+            state_mgr = self._get_state_manager(local_path)
             new_mapping = SyncMapping(
                 local_path=local_path,
                 lark_document_id=document_id,
@@ -328,7 +396,7 @@ class SyncEngine:
                 remote_revision_at_sync=current_revision,
                 sync_direction=SyncDirection.FROM_LARK,
             )
-            self._state.add_mapping(new_mapping)
+            state_mgr.add_mapping(new_mapping)
 
         logger.info(
             "Synced Lark document %s -> local file %s (rev %d)",
@@ -351,12 +419,30 @@ class SyncEngine:
     def get_sync_status(
         self, local_path: str | None = None
     ) -> list[SyncStatusEntry]:
-        """Return the sync status of all tracked mappings."""
-        state = self._state.load()
-        mappings = state.mappings
+        """Return the sync status of all tracked mappings.
 
+        When *local_path* is given, the appropriate project-local or global
+        state manager is consulted.  Otherwise, all known state managers
+        (global + cached project states) are queried.
+        """
         if local_path is not None:
-            mappings = [m for m in mappings if m.local_path == local_path]
+            state_mgr = self._get_state_manager(local_path)
+            state = state_mgr.load()
+            mappings = [
+                m for m in state.mappings
+                if m.local_path == local_path
+                or m.local_path == state_mgr._normalize_path(local_path)
+            ]
+        else:
+            # Gather mappings from all known state managers.
+            mappings: list[SyncMapping] = []
+            seen_doc_ids: set[str] = set()
+            for mgr in [self._state, *self._project_states.values()]:
+                state = mgr.load()
+                for m in state.mappings:
+                    if m.lark_document_id not in seen_doc_ids:
+                        mappings.append(m)
+                        seen_doc_ids.add(m.lark_document_id)
 
         entries: list[SyncStatusEntry] = []
 

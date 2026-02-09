@@ -84,13 +84,25 @@ class SyncStateManager:
     which local files map to which Lark documents, along with the
     hashes and revisions that were current at the last sync.
 
+    When ``project_root`` is provided, paths are stored as POSIX-style
+    relative paths (e.g. ``docs/prd.md``) and resolved against
+    ``project_root`` for file operations.
+
     Args:
         state_file: Path to the JSON state file.
+        project_root: Optional project root for relative path support.
     """
 
-    def __init__(self, state_file: str) -> None:
+    def __init__(
+        self, state_file: str, project_root: Path | None = None
+    ) -> None:
         self._state_file = Path(state_file)
+        self._project_root = project_root
         self._state: SyncState | None = None
+
+    @property
+    def project_root(self) -> Path | None:
+        return self._project_root
 
     # ------------------------------------------------------------------
     # Persistence
@@ -143,6 +155,10 @@ class SyncStateManager:
     def get_mapping(self, local_path: str) -> SyncMapping | None:
         """Look up a mapping by local file path.
 
+        When the state manager is in project-local mode, incoming
+        absolute paths are converted to relative for lookup, and
+        incoming relative paths are matched as-is.
+
         Args:
             local_path: The path used as the mapping key.
 
@@ -150,8 +166,9 @@ class SyncStateManager:
             The matching ``SyncMapping`` or ``None``.
         """
         state = self._ensure_loaded()
+        lookup = self._normalize_path(local_path)
         for mapping in state.mappings:
-            if mapping.local_path == local_path:
+            if mapping.local_path == lookup:
                 return mapping
         return None
 
@@ -178,16 +195,19 @@ class SyncStateManager:
         """Add a new mapping and persist to disk.
 
         If a mapping with the same ``local_path`` already exists it will
-        be replaced.
+        be replaced.  In project-local mode, the mapping's local_path
+        is converted to a relative POSIX path before storage.
 
         Args:
             mapping: The ``SyncMapping`` to add.
         """
         state = self._ensure_loaded()
-        # Remove any existing mapping for the same local path.
+        normalized = self._normalize_path(mapping.local_path)
+        # Remove any existing mapping for the same path.
         state.mappings = [
-            m for m in state.mappings if m.local_path != mapping.local_path
+            m for m in state.mappings if m.local_path != normalized
         ]
+        mapping.local_path = normalized
         state.mappings.append(mapping)
         self.save(state)
 
@@ -203,13 +223,14 @@ class SyncStateManager:
             KeyError: If no mapping exists for the given path.
         """
         state = self._ensure_loaded()
+        lookup = self._normalize_path(local_path)
         for mapping in state.mappings:
-            if mapping.local_path == local_path:
+            if mapping.local_path == lookup:
                 for key, value in updates.items():
                     setattr(mapping, key, value)
                 self.save(state)
                 return
-        raise KeyError(f"No mapping found for local path: {local_path}")
+        raise KeyError(f"No mapping found for local path: {lookup}")
 
     def remove_mapping(self, local_path: str) -> None:
         """Remove a mapping by local path and persist.
@@ -220,7 +241,42 @@ class SyncStateManager:
             local_path: The path identifying the mapping to remove.
         """
         state = self._ensure_loaded()
+        lookup = self._normalize_path(local_path)
         state.mappings = [
-            m for m in state.mappings if m.local_path != local_path
+            m for m in state.mappings if m.local_path != lookup
         ]
         self.save(state)
+
+    # ------------------------------------------------------------------
+    # Path helpers
+    # ------------------------------------------------------------------
+
+    def _normalize_path(self, local_path: str) -> str:
+        """Normalize a path for storage/lookup.
+
+        In project-local mode, absolute paths are converted to relative
+        POSIX paths.  Otherwise the path is returned as-is.
+        """
+        if self._project_root is None:
+            return local_path
+        p = Path(local_path)
+        if p.is_absolute():
+            try:
+                return p.relative_to(self._project_root).as_posix()
+            except ValueError:
+                # Path is outside project — store as-is.
+                return local_path
+        return p.as_posix()
+
+    def resolve_path(self, local_path: str) -> str:
+        """Resolve a stored path to an absolute path for file operations.
+
+        In project-local mode, relative paths are resolved against
+        ``project_root``.  Absolute paths are returned as-is.
+        """
+        if self._project_root is None:
+            return local_path
+        p = Path(local_path)
+        if not p.is_absolute():
+            return str(self._project_root / p)
+        return local_path
