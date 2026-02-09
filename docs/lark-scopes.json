@@ -1,0 +1,40 @@
+{
+  "scopes": {
+    "tenant": [
+      "docx:document",
+      "docx:document:readonly",
+      "drive:drive",
+      "drive:drive:readonly",
+      "wiki:wiki",
+      "wiki:wiki:readonly",
+      "im:message:send_as_bot",
+      "search:docs_content"
+    ],
+    "user": [
+      "docx:document",
+      "docx:document:readonly",
+      "drive:drive",
+      "drive:drive:readonly",
+      "wiki:wiki",
+      "wiki:wiki:readonly",
+      "sheets:spreadsheet:readonly",
+      "bitable:app:readonly",
+      "contact:contact.base:readonly",
+      "offline_access"
+    ]
+  },
+  "_notes": {
+    "docx:document": "Full read/write access to cloud documents (create, read, edit, import)",
+    "docx:document:readonly": "Read-only access to cloud documents",
+    "drive:drive": "Full access to cloud drive files (needed for images and file operations)",
+    "drive:drive:readonly": "Read-only access to cloud drive files",
+    "wiki:wiki": "Full access to wiki/knowledge base spaces and nodes",
+    "wiki:wiki:readonly": "Read-only access to wiki/knowledge base",
+    "im:message:send_as_bot": "Send sync status notifications as bot (tenant only)",
+    "search:docs_content": "Search across documents by keyword (tenant only)",
+    "sheets:spreadsheet:readonly": "Read spreadsheet content if referenced in docs",
+    "bitable:app:readonly": "Read multidimensional table content if referenced in docs",
+    "contact:contact.base:readonly": "Resolve @mentions and user references in documents",
+    "offline_access": "Enables refresh tokens for background sync without re-auth"
+  }
+}
